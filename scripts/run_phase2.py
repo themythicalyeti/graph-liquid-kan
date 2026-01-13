@@ -208,7 +208,7 @@ def main():
 
             # Update saved graph with weights
             import torch
-            graph_data = torch.load(graph_path)
+            graph_data = torch.load(graph_path, weights_only=False)
             graph_data["edge_weights"] = edge_weights
             torch.save(graph_data, graph_path)
 
@@ -266,7 +266,7 @@ def main():
         import numpy as np
 
         # Load and verify graph
-        graph_data = torch.load(graph_path)
+        graph_data = torch.load(graph_path, weights_only=False)
         n_edges = graph_data["edge_index"].shape[1]
         n_nodes = graph_data.get("n_nodes", graph_data["degree"].shape[0])
 

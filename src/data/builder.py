@@ -132,8 +132,9 @@ class GLKANDatasetBuilder:
     def load_hydrography(self, hydro_path: Union[str, Path]) -> None:
         """Load hydrography NetCDF file."""
         logger.info(f"Loading hydrography from: {hydro_path}")
-        self.hydro_ds = xr.open_dataset(hydro_path)
-        logger.info(f"Hydrography dimensions: {dict(self.hydro_ds.dims)}")
+        # Use scipy engine to avoid Windows path issues with special characters
+        self.hydro_ds = xr.open_dataset(hydro_path, engine='scipy')
+        logger.info(f"Hydrography dimensions: {dict(self.hydro_ds.sizes)}")
 
     def _week_to_date(self, year: int, week: int) -> Optional[datetime]:
         """
