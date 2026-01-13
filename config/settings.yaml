@@ -1,0 +1,94 @@
+# Graph-Liquid-KAN Configuration
+# Phase 1: Data Engineering Settings
+
+# =============================================================================
+# Data Sources
+# =============================================================================
+
+barentswatch:
+  # OAuth2 credentials loaded from environment variables
+  # BARENTSWATCH_CLIENT_ID and BARENTSWATCH_CLIENT_SECRET
+  retry_attempts: 3
+  retry_delay: 60  # seconds
+  rate_limit_delay: 1.0  # seconds between API calls
+
+norkyst800:
+  # MET Norway THREDDS server
+  base_url: "https://thredds.met.no/thredds/dodsC"
+  hourly_aggregate: "sea/norkyst800m/1h/aggregate_be"
+
+  # Depth selection
+  depth_mixed_layer: 3.0  # meters (for tau(T) time constant)
+
+  # Spatial mapping parameters
+  max_dist_threshold: 0.02  # degrees (~2km) - sanity check for inland farms
+  n_neighbors: 9  # KD-Tree neighbors for land-mask fallback
+
+  # Clustering for optimized extraction
+  n_clusters: 13  # ~Norwegian Production Areas
+  buffer_deg: 0.15  # Buffer around clusters
+
+# =============================================================================
+# Output Paths
+# =============================================================================
+
+paths:
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  cache: "data/cache"
+  logs: "data/logs"
+
+  barentswatch_output: "data/raw/barentswatch"
+  norkyst800_output: "data/raw/norkyst800"
+
+# =============================================================================
+# Data Time Ranges
+# =============================================================================
+
+time_range:
+  # Default date range for data acquisition
+  from_year: 2022
+  to_year: 2024
+
+  # Training/validation/test split ratios
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+
+# =============================================================================
+# Feature Engineering (Phase 2)
+# =============================================================================
+
+features:
+  # Environmental features
+  environmental:
+    - temperature
+    - salinity
+    - current_speed
+
+  # Biological features (from lice reports)
+  biological:
+    - avg_adult_female_lice
+    - avg_mobile_lice
+    - avg_stationary_lice
+
+  # Treatment features (binary)
+  treatment:
+    - is_mechanical
+    - is_medicinal
+    - is_cleaner_fish
+
+# =============================================================================
+# Model Configuration (Phase 3-4)
+# =============================================================================
+
+model:
+  # Sequence parameters
+  sequence_length: 14  # days of input context
+  prediction_horizon: 21  # days to predict ahead
+  stride: 7  # days between sequences (weekly)
+
+  # Model architecture (placeholder for Phase 3)
+  hidden_dim: 64
+  n_layers: 2
+  dropout: 0.1
