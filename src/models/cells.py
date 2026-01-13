@@ -54,8 +54,12 @@ class LiquidKANCell(nn.Module):
         hidden_dim: Dimension of hidden state h
         pressure_dim: Dimension of infection pressure p (usually = hidden_dim)
         n_bases: Number of RBF bases for KAN layers
-        tau_min: Minimum time constant (prevents instability)
+        tau_min: Minimum time constant (MUST be >= 1.0 to prevent saturation)
         tau_max: Maximum time constant (prevents frozen dynamics)
+
+    IMPORTANT: tau_min MUST be >= 1.0 to prevent LTC saturation.
+    If tau is too small (e.g., 0.01), the decay term exp(-dt/tau) ≈ 0,
+    causing the hidden state to be wiped out and converge to dataset mean.
     """
 
     def __init__(
@@ -64,7 +68,7 @@ class LiquidKANCell(nn.Module):
         hidden_dim: int,
         pressure_dim: Optional[int] = None,
         n_bases: int = 8,
-        tau_min: float = 0.01,
+        tau_min: float = 1.0,  # CRITICAL: Must be >= 1.0 to prevent saturation
         tau_max: float = 10.0,
     ):
         super().__init__()
@@ -195,7 +199,7 @@ class GraphLiquidKANCell(nn.Module):
         hidden_dim: Dimension of hidden state
         n_bases: Number of RBF bases for KAN layers
         add_self_loops: Whether to add self-loops in graph aggregation
-        tau_min: Minimum time constant
+        tau_min: Minimum time constant (MUST be >= 1.0)
         tau_max: Maximum time constant
     """
 
@@ -205,7 +209,7 @@ class GraphLiquidKANCell(nn.Module):
         hidden_dim: int,
         n_bases: int = 8,
         add_self_loops: bool = True,
-        tau_min: float = 0.01,
+        tau_min: float = 1.0,  # CRITICAL: Must be >= 1.0 to prevent saturation
         tau_max: float = 10.0,
     ):
         super().__init__()

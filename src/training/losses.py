@@ -5,11 +5,15 @@ We do not minimize error; we minimize ENERGY. The loss function represents
 deviation from observed data PLUS deviation from physical and biological laws.
 
 Loss Components:
-1. L_data: Huber loss on masked observations (robust to outliers)
+1. L_data: Tweedie loss for zero-inflated count data (or Huber as fallback)
 2. L_bio: Biological constraints (non-negativity, growth rate bounds)
 3. L_stability: System stability (tau regularization)
 
 Total: L = L_data + λ_bio * L_bio + λ_stability * L_stability
+
+IMPORTANT: For zero-inflated biological count data (sea lice), MSE/Huber
+causes "mean reversion" where the model predicts dataset mean for all inputs.
+Tweedie loss (p=1.5) properly handles the zero-inflated distribution.
 """
 
 import torch
@@ -22,6 +26,13 @@ from dataclasses import dataclass
 @dataclass
 class LossConfig:
     """Configuration for Physics-Informed Loss."""
+    # Loss type: 'tweedie' (recommended for zero-inflated) or 'huber'
+    loss_type: str = 'tweedie'
+
+    # Tweedie power parameter (1 < p < 2 for compound Poisson-Gamma)
+    # p=1.5 is recommended for zero-inflated biological counts
+    tweedie_p: float = 1.5
+
     # Huber loss delta (transition from quadratic to linear)
     huber_delta: float = 1.0
 
@@ -50,8 +61,9 @@ class PhysicsInformedLoss(nn.Module):
     learns biologically plausible dynamics, not just curve fitting.
 
     Components:
-    1. Data Fidelity (L_data): Huber loss on masked observations
-       - Robust to outliers in biological measurements
+    1. Data Fidelity (L_data): Tweedie loss (recommended) or Huber loss
+       - Tweedie: Optimal for zero-inflated count data (sea lice)
+       - Huber: Fallback for general robustness
        - Only computed where ground-truth exists (mask=True)
 
     2. Biological Constraints (L_bio):
@@ -70,8 +82,11 @@ class PhysicsInformedLoss(nn.Module):
         super().__init__()
         self.config = config or LossConfig()
 
-        # Huber loss for robustness
+        # Huber loss for fallback
         self.huber = nn.SmoothL1Loss(reduction='none', beta=self.config.huber_delta)
+
+        # Store Tweedie power parameter
+        self.tweedie_p = self.config.tweedie_p
 
     def forward(
         self,
@@ -138,7 +153,10 @@ class PhysicsInformedLoss(nn.Module):
         mask: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute Huber loss on masked observations.
+        Compute data fidelity loss on masked observations.
+
+        For zero-inflated count data (sea lice), uses Tweedie loss (p=1.5)
+        which properly models compound Poisson-Gamma distributions.
 
         Only days with ground-truth observations contribute to the loss.
         The ODE fills in the gaps, but we don't penalize interpolated values.
@@ -149,11 +167,30 @@ class PhysicsInformedLoss(nn.Module):
         else:
             mask_expanded = mask
 
-        # Compute Huber loss (element-wise)
-        huber_loss = self.huber(predictions, targets)
+        if self.config.loss_type == 'tweedie':
+            # Tweedie Loss for zero-inflated count data
+            # L = y * mu^(1-p) / (1-p) - mu^(2-p) / (2-p)
+            # where mu = predictions (must be > 0)
+            p = self.tweedie_p
 
-        # Apply mask
-        masked_loss = huber_loss * mask_expanded.float()
+            # Ensure predictions are positive (model should use softplus output)
+            # Add small epsilon for numerical stability
+            mu = predictions.clamp(min=1e-6)
+
+            # Compute Tweedie deviance loss
+            # d = 2 * (y^(2-p) / ((1-p)*(2-p)) - y*mu^(1-p)/(1-p) + mu^(2-p)/(2-p))
+            # Simplified negative log-likelihood form:
+            term1 = torch.pow(mu, 2 - p) / (2 - p)
+            term2 = targets * torch.pow(mu, 1 - p) / (1 - p)
+            loss = term1 - term2
+
+            # Apply mask
+            masked_loss = loss * mask_expanded.float()
+        else:
+            # Fallback: Huber loss (element-wise)
+            huber_loss = self.huber(predictions, targets)
+            # Apply mask
+            masked_loss = huber_loss * mask_expanded.float()
 
         # Average over valid observations
         n_valid = mask_expanded.float().sum()

@@ -45,7 +45,7 @@ class GLKANNetwork(nn.Module):
         n_bases: Number of RBF bases for KAN layers
         n_layers: Number of stacked GLKAN cells (depth)
         dropout: Dropout probability
-        tau_min: Minimum time constant
+        tau_min: Minimum time constant (MUST be >= 1.0 to prevent LTC saturation)
         tau_max: Maximum time constant
     """
 
@@ -57,7 +57,7 @@ class GLKANNetwork(nn.Module):
         n_bases: int = 8,
         n_layers: int = 1,
         dropout: float = 0.1,
-        tau_min: float = 0.01,
+        tau_min: float = 1.0,  # CRITICAL: Must be >= 1.0 to prevent saturation
         tau_max: float = 10.0,
     ):
         super().__init__()
@@ -135,7 +135,7 @@ class GLKANNetwork(nn.Module):
         else:
             squeeze_batch = False
 
-        B, T, N, F = x.shape
+        B, T, N, D = x.shape  # D=feature dimension (avoid shadowing F=torch.nn.functional)
 
         # Compute time steps (dt between consecutive points)
         if time_points is None:
@@ -207,6 +207,12 @@ class GLKANNetwork(nn.Module):
             # Decode output from final layer hidden state
             h_final = h_list[-1]  # (B, N, hidden_dim)
             y_t = self.output_decoder(h_final)  # (B, N, output_dim)
+
+            # CRITICAL: Apply softplus for non-negativity
+            # This is REQUIRED for:
+            # 1. Tweedie loss (requires positive predictions)
+            # 2. Biological validity (lice counts cannot be negative)
+            y_t = F.softplus(y_t)
 
             outputs.append(y_t)
 
