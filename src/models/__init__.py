@@ -13,12 +13,14 @@ Modules:
 """
 
 from .layers import FastKAN, GraphonAggregator
-from .cells import LiquidKANCell
-from .network import GLKANNetwork
+from .cells import LiquidKANCell, GraphLiquidKANCell
+from .network import GLKANNetwork, GLKANPredictor
 
 __all__ = [
     "FastKAN",
     "GraphonAggregator",
     "LiquidKANCell",
+    "GraphLiquidKANCell",
     "GLKANNetwork",
+    "GLKANPredictor",
 ]
