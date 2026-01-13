@@ -50,6 +50,11 @@ class BuilderConfig:
         "avg_adult_female_lice", "avg_mobile_lice", "avg_stationary_lice"
     ])
 
+    # AUTOREGRESSIVE FEATURES - CRITICAL FOR PREDICTIVE POWER
+    # Past lice counts are the best predictor of future lice counts
+    use_autoregressive: bool = True  # Enable lagged lice features
+    ar_lags: List[int] = field(default_factory=lambda: [7, 14])  # Lag in days (1 week, 2 weeks)
+
     # Temporal resolution
     resample_freq: str = "1D"  # Daily
 
@@ -399,6 +404,73 @@ class GLKANDatasetBuilder:
 
         return Y, mask
 
+    def _process_autoregressive_features(
+        self,
+        Y: np.ndarray,
+        mask: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Create autoregressive features from lagged lice counts.
+
+        CRITICAL: Past lice counts are the strongest predictor of future counts.
+        This adds lagged versions of Y as input features.
+
+        For each lag L in ar_lags:
+        - X_ar[t] = Y[t-L] (shifted by L days)
+        - Also includes a binary "has_observation" flag for each lag
+
+        Args:
+            Y: (T, N, 3) lice count tensor
+            mask: (T, N) observation mask
+
+        Returns:
+            X_ar: (T, N, n_ar_features) autoregressive feature tensor
+                  where n_ar_features = len(ar_lags) * (3 lice types + 1 mask flag)
+        """
+        if not self.config.use_autoregressive:
+            return np.zeros((Y.shape[0], Y.shape[1], 0), dtype=np.float32)
+
+        T, N, _ = Y.shape
+        lags = self.config.ar_lags
+        n_features_per_lag = 4  # 3 lice counts + 1 observation flag
+
+        X_ar = np.zeros((T, N, len(lags) * n_features_per_lag), dtype=np.float32)
+
+        logger.info(f"Creating autoregressive features with lags: {lags}")
+
+        for lag_idx, lag in enumerate(lags):
+            feat_offset = lag_idx * n_features_per_lag
+
+            # Shift Y by lag days
+            if lag < T:
+                # Y values from lag days ago
+                X_ar[lag:, :, feat_offset:feat_offset+3] = Y[:-lag, :, :]
+
+                # Observation flag from lag days ago
+                X_ar[lag:, :, feat_offset+3] = mask[:-lag].astype(np.float32)
+
+            logger.info(f"  Lag {lag} days: {(X_ar[:, :, feat_offset+3] > 0).sum()} observations available")
+
+        # Forward-fill missing values within each farm
+        # This propagates the last known observation forward in time
+        logger.info("Forward-filling missing autoregressive values...")
+        for n in range(N):
+            for lag_idx, lag in enumerate(lags):
+                feat_offset = lag_idx * n_features_per_lag
+                obs_flag_idx = feat_offset + 3
+
+                last_known = np.zeros(3)
+                for t in range(T):
+                    if X_ar[t, n, obs_flag_idx] > 0:
+                        # Have an observation at this lag
+                        last_known = X_ar[t, n, feat_offset:feat_offset+3].copy()
+                    else:
+                        # No observation - use last known value
+                        X_ar[t, n, feat_offset:feat_offset+3] = last_known
+
+        logger.info(f"Autoregressive features shape: {X_ar.shape}")
+        return X_ar
+
     def build_dataset(
         self,
         start_date: str,
@@ -437,22 +509,28 @@ class GLKANDatasetBuilder:
         logger.info(f"Timeline: {start_date} to {end_date} ({T} days)")
         logger.info(f"Farms: {N}")
 
+        # Process lice labels FIRST (needed for autoregressive features)
+        logger.info("\n[1/4] Processing lice labels...")
+        Y, mask = self._process_lice_labels(start_dt, end_dt, dates)
+
+        # Process autoregressive features (lagged lice counts)
+        logger.info("\n[2/4] Processing autoregressive features (lagged lice)...")
+        X_ar = self._process_autoregressive_features(Y, mask)
+
         # Process environmental features
-        logger.info("\n[1/3] Processing environmental features...")
+        logger.info("\n[3/4] Processing environmental features...")
         X_env = self._process_environmental_features(start_dt, end_dt, dates)
 
         # Process treatment features
-        logger.info("\n[2/3] Processing treatment features...")
+        logger.info("\n[4/4] Processing treatment features...")
         X_treat = self._process_treatment_features(start_dt, end_dt, dates)
 
-        # Process lice labels
-        logger.info("\n[3/3] Processing lice labels...")
-        Y, mask = self._process_lice_labels(start_dt, end_dt, dates)
-
-        # Concatenate features
-        X = np.concatenate([X_env, X_treat], axis=-1)  # (T, N, F_env + F_treat)
+        # Concatenate features: [autoregressive, environmental, treatment]
+        # Autoregressive first because it's the most predictive!
+        X = np.concatenate([X_ar, X_env, X_treat], axis=-1)
 
         logger.info(f"\nFinal feature tensor X: {X.shape}")
+        logger.info(f"  Autoregressive features: {X_ar.shape[-1]} (CRITICAL for prediction)")
         logger.info(f"  Environmental features: {X_env.shape[-1]}")
         logger.info(f"  Treatment features: {X_treat.shape[-1]}")
 
