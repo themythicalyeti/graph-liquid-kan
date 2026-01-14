@@ -31,6 +31,14 @@ def main():
     mask = torch.from_numpy(data["mask"]).bool()  # (366, 1777)
     edge_index = graph_data["edge_index"]
 
+    # Load feature indices for SeaLiceGLKAN
+    if "feature_indices" in data:
+        feature_indices = data["feature_indices"].item()
+        logger.info(f"Loaded feature_indices: {list(feature_indices.keys())}")
+    else:
+        feature_indices = None
+        logger.warning("No feature_indices found - using defaults")
+
     logger.info(f"Original: X={X.shape}, edges={edge_index.shape[1]}")
 
     # Subset to first N_subset nodes
@@ -60,16 +68,16 @@ def main():
     logger.info(f"  y: {y_batch.shape}")
     logger.info(f"  mask: {mask_batch.shape}")
 
-    # Create model
-    logger.info("\nCreating model...")
-    from src.models.network import GLKANPredictor
+    # Create model (using SeaLicePredictor with biology modules)
+    logger.info("\nCreating SeaLicePredictor model...")
+    from src.models.sea_lice_network import SeaLicePredictor
 
-    model = GLKANPredictor(
+    model = SeaLicePredictor(
         input_dim=F,
         hidden_dim=64,
         output_dim=3,
         n_bases=8,
-        n_layers=1,
+        k_hops=3,
         dropout=0.1,
     )
 
@@ -82,6 +90,7 @@ def main():
         'y': y_batch,
         'mask': mask_batch,
         'edge_index': edge_index,
+        'feature_indices': feature_indices,
     }
 
     # Test forward pass
@@ -102,12 +111,12 @@ def main():
 
     from src.training.losses import GLKANLoss
 
-    model = GLKANPredictor(
+    model = SeaLicePredictor(
         input_dim=F,
         hidden_dim=64,
         output_dim=3,
         n_bases=8,
-        n_layers=1,
+        k_hops=3,
     )
 
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
@@ -153,11 +162,12 @@ def main():
 
     # Create simple dataset from numpy arrays
     class SimpleDataset(torch.utils.data.Dataset):
-        def __init__(self, X, Y, mask, edge_index, window_size=30, stride=7):
+        def __init__(self, X, Y, mask, edge_index, feature_indices=None, window_size=30, stride=7):
             self.X = X
             self.Y = Y
             self.mask = mask
             self.edge_index = edge_index
+            self.feature_indices = feature_indices
             self.sequences = []
 
             T = X.shape[0]
@@ -175,6 +185,7 @@ def main():
                 'mask': self.mask[t_start:t_end],
                 'edge_index': self.edge_index,
                 'time_points': torch.linspace(0, 1, t_end - t_start),
+                'feature_indices': self.feature_indices,
             }
 
     def collate_fn(batch):
@@ -184,6 +195,7 @@ def main():
             'mask': torch.stack([b['mask'] for b in batch]),
             'edge_index': batch[0]['edge_index'],
             'time_points': batch[0]['time_points'],
+            'feature_indices': batch[0]['feature_indices'],
         }
 
     # Reload and subset full data
@@ -195,8 +207,8 @@ def main():
     T_total = X_full.shape[0]
     T_train = int(T_total * 0.8)
 
-    train_ds = SimpleDataset(X_full[:T_train], Y_full[:T_train], mask_full[:T_train], edge_index)
-    val_ds = SimpleDataset(X_full[T_train:], Y_full[T_train:], mask_full[T_train:], edge_index)
+    train_ds = SimpleDataset(X_full[:T_train], Y_full[:T_train], mask_full[:T_train], edge_index, feature_indices)
+    val_ds = SimpleDataset(X_full[T_train:], Y_full[T_train:], mask_full[T_train:], edge_index, feature_indices)
 
     logger.info(f"Train sequences: {len(train_ds)}")
     logger.info(f"Val sequences: {len(val_ds)}")
@@ -205,12 +217,12 @@ def main():
     val_loader = torch.utils.data.DataLoader(val_ds, batch_size=4, shuffle=False, collate_fn=collate_fn)
 
     # Create fresh model
-    model = GLKANPredictor(
+    model = SeaLicePredictor(
         input_dim=F,
         hidden_dim=64,
         output_dim=3,
         n_bases=8,
-        n_layers=1,
+        k_hops=3,
     )
 
     # Create trainer

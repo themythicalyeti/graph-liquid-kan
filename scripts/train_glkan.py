@@ -54,10 +54,14 @@ def main():
                         help="Hidden state dimension")
     parser.add_argument("--n-bases", type=int, default=8,
                         help="Number of RBF basis functions")
-    parser.add_argument("--n-layers", type=int, default=1,
-                        help="Number of GLKAN layers")
+    parser.add_argument("--k-hops", type=int, default=3,
+                        help="Number of hops for spatial aggregation")
     parser.add_argument("--dropout", type=float, default=0.1,
                         help="Dropout rate")
+    parser.add_argument("--use-larval-transport", action="store_true", default=True,
+                        help="Enable larval transport module")
+    parser.add_argument("--use-mass-conservation", action="store_true", default=True,
+                        help="Enable mass conservation constraint")
 
     # Training
     parser.add_argument("--epochs", type=int, default=100,
@@ -125,7 +129,7 @@ def main():
         collate_graph_sequences,
         create_dataloaders,
     )
-    from src.models.network import GLKANPredictor
+    from src.models.sea_lice_network import SeaLicePredictor
     from src.training.losses import LossConfig
     from src.training.trainer import GLKANTrainer, TrainingConfig, overfit_one_batch
     from src.training.audit import run_full_audit, AuditConfig
@@ -154,15 +158,17 @@ def main():
     input_dim = sample_batch['x'].shape[-1]
     logger.info(f"Input dimension: {input_dim}")
 
-    # Create model
-    logger.info("\nCreating model...")
-    model = GLKANPredictor(
+    # Create model (using SeaLicePredictor with biology modules)
+    logger.info("\nCreating SeaLicePredictor model with biological modules...")
+    model = SeaLicePredictor(
         input_dim=input_dim,
         hidden_dim=args.hidden_dim,
         output_dim=3,  # adult_female, mobile, stationary
         n_bases=args.n_bases,
-        n_layers=args.n_layers,
+        k_hops=args.k_hops,
         dropout=args.dropout,
+        use_larval_transport=args.use_larval_transport,
+        use_mass_conservation=args.use_mass_conservation,
     )
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -191,13 +197,15 @@ def main():
             logger.warning("Proceeding with training anyway...")
 
         # Reset model for actual training
-        model = GLKANPredictor(
+        model = SeaLicePredictor(
             input_dim=input_dim,
             hidden_dim=args.hidden_dim,
             output_dim=3,
             n_bases=args.n_bases,
-            n_layers=args.n_layers,
+            k_hops=args.k_hops,
             dropout=args.dropout,
+            use_larval_transport=args.use_larval_transport,
+            use_mass_conservation=args.use_mass_conservation,
         )
 
     # Create training config

@@ -32,14 +32,14 @@ from .losses import GLKANLoss, LossConfig, compute_rmse, compute_mae
 class TrainingConfig:
     """Configuration for GLKAN training."""
     # Optimizer
-    learning_rate: float = 1e-4  # Start small - KANs are sensitive
+    learning_rate: float = 1e-2  # High LR needed for Tweedie loss to escape mean-collapse
     weight_decay: float = 1e-4  # Prevents spline coefficient oscillation
     betas: Tuple[float, float] = (0.9, 0.999)
 
-    # Scheduler
-    scheduler_patience: int = 10
-    scheduler_factor: float = 0.5
-    min_lr: float = 1e-7
+    # Scheduler - ReduceLROnPlateau
+    scheduler_patience: int = 15  # Epochs without improvement before reducing LR
+    scheduler_factor: float = 0.5  # Multiply LR by this factor when reducing
+    min_lr: float = 1e-6  # Don't reduce below this
 
     # Gradient clipping - NON-NEGOTIABLE for ODE stability
     max_grad_norm: float = 1.0
@@ -111,13 +111,14 @@ class GLKANTrainer:
             betas=self.config.betas,
         )
 
-        # Scheduler - ReduceLROnPlateau
+        # Scheduler - ReduceLROnPlateau with verbose logging
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
             mode='min',
             factor=self.config.scheduler_factor,
             patience=self.config.scheduler_patience,
             min_lr=self.config.min_lr,
+            verbose=True,  # Print when LR is reduced
         )
 
         # Training state
@@ -289,7 +290,8 @@ class GLKANTrainer:
         logger.info("=" * 60)
         logger.info(f"Device: {self.config.device}")
         logger.info(f"Epochs: {n_epochs}")
-        logger.info(f"Learning rate: {self.config.learning_rate}")
+        logger.info(f"Learning rate: {self.config.learning_rate} (reduces by {self.config.scheduler_factor}x after {self.config.scheduler_patience} epochs w/o improvement)")
+        logger.info(f"Min LR: {self.config.min_lr}")
         logger.info(f"Weight decay: {self.config.weight_decay}")
         logger.info(f"Grad clip norm: {self.config.max_grad_norm}")
 
@@ -312,8 +314,13 @@ class GLKANTrainer:
                 val_metrics = self.validate()
                 self.val_history.append(val_metrics)
 
-                # Update scheduler
+                # Update scheduler (track LR changes)
+                old_lr = self.optimizer.param_groups[0]['lr']
                 self.scheduler.step(val_metrics['val_loss'])
+                new_lr = self.optimizer.param_groups[0]['lr']
+
+                if new_lr < old_lr:
+                    logger.info(f">>> LR REDUCED: {old_lr:.2e} -> {new_lr:.2e} <<<")
 
                 # Check for improvement
                 if val_metrics['val_loss'] < self.best_val_loss - self.config.early_stopping_min_delta:

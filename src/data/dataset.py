@@ -106,6 +106,15 @@ class SeaLiceGraphDataset(Dataset):
             self.feature_mean = None
             self.feature_std = None
 
+        # Load feature indices for SeaLiceGLKAN (maps feature names to column indices)
+        if "feature_indices" in data:
+            self.feature_indices = data["feature_indices"].item()  # Convert from numpy object
+            logger.info(f"Loaded feature_indices for SeaLiceGLKAN: {list(self.feature_indices.keys())}")
+        else:
+            # Default feature indices if not saved in tensor file
+            self.feature_indices = None
+            logger.warning("No feature_indices found in tensor file - using defaults")
+
         self.total_time, self.num_nodes, self.num_features = self.X.shape
         self.num_targets = self.Y.shape[-1]
 
@@ -207,6 +216,7 @@ class SeaLiceGraphDataset(Dataset):
                 degree=self.degree,
                 time_points=time_points,
                 num_nodes=self.num_nodes,
+                feature_indices=self.feature_indices,  # For SeaLiceGLKAN
             )
             return data
         else:
@@ -218,6 +228,7 @@ class SeaLiceGraphDataset(Dataset):
                 "edge_index": self.edge_index,
                 "degree": self.degree,
                 "time_points": time_points,
+                "feature_indices": self.feature_indices,  # For SeaLiceGLKAN
             }
 
     def get_full_sequence(self) -> Dict[str, torch.Tensor]:
@@ -258,6 +269,7 @@ def collate_graph_sequences(batch: List) -> Dict[str, torch.Tensor]:
         # Edge index is shared across batch
         edge_index = batch[0].edge_index
         degree = batch[0].degree
+        feature_indices = batch[0].feature_indices
     else:
         # Dictionary format
         x_list = [b["x"] for b in batch]
@@ -266,6 +278,7 @@ def collate_graph_sequences(batch: List) -> Dict[str, torch.Tensor]:
         time_list = [b["time_points"] for b in batch]
         edge_index = batch[0]["edge_index"]
         degree = batch[0]["degree"]
+        feature_indices = batch[0]["feature_indices"]
 
     # Stack into batch: (B, T, N, F)
     x_batch = torch.stack(x_list, dim=0)
@@ -280,6 +293,7 @@ def collate_graph_sequences(batch: List) -> Dict[str, torch.Tensor]:
         "time_points": time_batch,  # (T,)
         "edge_index": edge_index,  # (2, E)
         "degree": degree,  # (N,)
+        "feature_indices": feature_indices,  # For SeaLiceGLKAN
     }
 
 

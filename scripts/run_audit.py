@@ -34,6 +34,14 @@ def main():
     mask = torch.from_numpy(data["mask"]).bool()
     edge_index = graph_data["edge_index"]
 
+    # Load feature indices for SeaLiceGLKAN
+    if "feature_indices" in data:
+        feature_indices = data["feature_indices"].item()
+        logger.info(f"Loaded feature_indices: {list(feature_indices.keys())}")
+    else:
+        feature_indices = None
+        logger.warning("No feature_indices found - using defaults")
+
     # Subset to 200 nodes for speed
     N_subset = 200
     X = X[:, :N_subset, :]
@@ -57,18 +65,19 @@ def main():
         'mask': mask_batch,
         'edge_index': edge_index,
         'time_points': torch.linspace(0, 1, window),
+        'feature_indices': feature_indices,
     }
 
     # Load or create model
-    logger.info("\nLoading model...")
-    from src.models.network import GLKANPredictor
+    logger.info("\nLoading SeaLicePredictor model...")
+    from src.models.sea_lice_network import SeaLicePredictor
 
-    model = GLKANPredictor(
+    model = SeaLicePredictor(
         input_dim=X.shape[-1],
         hidden_dim=64,
         output_dim=3,
         n_bases=8,
-        n_layers=1,
+        k_hops=3,
     )
 
     # Try to load checkpoint

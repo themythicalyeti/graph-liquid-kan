@@ -274,6 +274,229 @@ def build_production_area_edges(
     return edge_index, degree
 
 
+def compute_flux_weights(
+    edge_index: torch.Tensor,
+    coords: np.ndarray,
+    current_u: np.ndarray,
+    current_v: np.ndarray,
+    dist_matrix: np.ndarray,
+    decay_km: float = 10.0,
+) -> torch.Tensor:
+    """
+    Compute edge weights based on ocean current flux (larval transport).
+
+    This is the KEY function for biologically-relevant graph weighting.
+    It computes how much current flows from farm A toward farm B.
+
+    Physics:
+        flux(A→B) = current_A · direction(A→B) / |direction(A→B)|
+
+    If flux > 0: water flows from A toward B (A is upstream, larvae drift to B)
+    If flux < 0: water flows from B toward A (ignore or set to 0)
+
+    The edge weight combines:
+    1. Flux magnitude (how fast water moves toward B)
+    2. Distance decay (larvae don't survive long transport)
+
+    Args:
+        edge_index: (2, E) edge indices [src, dst]
+        coords: (N, 2) array of [lat, lon] coordinates
+        current_u: (N,) or (T, N) eastward current at each farm (m/s)
+        current_v: (N,) or (T, N) northward current at each farm (m/s)
+        dist_matrix: (N, N) distance matrix in km
+        decay_km: Distance decay scale for larval survival
+
+    Returns:
+        (E,) tensor of flux-based edge weights
+    """
+    logger.info("Computing flux-based edge weights from ocean currents...")
+
+    src = edge_index[0].numpy()
+    dst = edge_index[1].numpy()
+    E = len(src)
+
+    # Handle time-averaged currents
+    if current_u.ndim == 2:
+        # Average over time
+        u_mean = np.nanmean(current_u, axis=0)  # (N,)
+        v_mean = np.nanmean(current_v, axis=0)  # (N,)
+    else:
+        u_mean = current_u
+        v_mean = current_v
+
+    # Get coordinates
+    lat = coords[:, 0]
+    lon = coords[:, 1]
+
+    # Compute direction vectors from src to dst
+    # Note: At Norwegian latitudes, 1 degree lat ≈ 111 km, 1 degree lon ≈ 55 km
+    lat_scale = 111.0  # km per degree latitude
+    lon_scale = 55.0   # km per degree longitude (approximate at 60°N)
+
+    # Direction vector from src to dst (in km)
+    dir_east = (lon[dst] - lon[src]) * lon_scale   # (E,) eastward component
+    dir_north = (lat[dst] - lat[src]) * lat_scale  # (E,) northward component
+
+    # Distance
+    distances = dist_matrix[src, dst]  # (E,)
+    distances = np.maximum(distances, 0.1)  # Avoid division by zero
+
+    # Normalize direction
+    dir_magnitude = np.sqrt(dir_east**2 + dir_north**2)
+    dir_magnitude = np.maximum(dir_magnitude, 0.1)
+    dir_east_norm = dir_east / dir_magnitude
+    dir_north_norm = dir_north / dir_magnitude
+
+    # Get currents at source farms
+    u_src = u_mean[src]  # (E,) eastward current at source
+    v_src = v_mean[src]  # (E,) northward current at source
+
+    # Compute flux: dot product of current and direction
+    # flux > 0 means current flows from src toward dst
+    flux = u_src * dir_east_norm + v_src * dir_north_norm  # (E,)
+
+    # Only keep positive flux (water flowing toward dst)
+    flux_positive = np.maximum(flux, 0)
+
+    # Apply distance decay (larvae die during transport)
+    distance_factor = np.exp(-distances / decay_km)
+
+    # Final weight: flux magnitude * distance decay
+    weights = flux_positive * distance_factor
+
+    # Normalize to [0, 1] range
+    if weights.max() > 0:
+        weights = weights / weights.max()
+
+    logger.info(f"  Flux weights computed for {E} edges")
+    logger.info(f"  Non-zero flux edges: {(weights > 0.01).sum()} ({100*(weights > 0.01).sum()/E:.1f}%)")
+    logger.info(f"  Weight range: [{weights.min():.4f}, {weights.max():.4f}]")
+
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def build_flux_weighted_graph(
+    nodes_path: Union[str, Path],
+    hydro_path: Union[str, Path],
+    distance_threshold_km: float = 30.0,
+    decay_km: float = 10.0,
+    output_path: Optional[Union[str, Path]] = None,
+) -> Dict:
+    """
+    Build a complete flux-weighted graph for larval transport.
+
+    This creates edges based on distance threshold, then weights them
+    by ocean current flux (how much water flows from source to destination).
+
+    Args:
+        nodes_path: Path to graph_nodes_metadata.csv
+        hydro_path: Path to hydrography NetCDF file with u, v currents
+        distance_threshold_km: Maximum distance for edge creation
+        decay_km: Distance decay scale for larval survival
+        output_path: Optional path to save the graph
+
+    Returns:
+        Dict with edge_index, edge_weights, degree, etc.
+    """
+    import xarray as xr
+
+    logger.info("=" * 60)
+    logger.info("BUILDING FLUX-WEIGHTED SPATIAL GRAPH")
+    logger.info("=" * 60)
+
+    # Build basic topology
+    edge_index, degree, dist_matrix = build_topology(
+        nodes_path, distance_threshold_km, include_self_loops=False
+    )
+
+    # Load coordinates and locality IDs
+    nodes_df = pd.read_csv(nodes_path)
+    coords = nodes_df[["latitude", "longitude"]].values
+    locality_ids = nodes_df["locality_id"].values
+    N = len(locality_ids)
+
+    # Load hydrography
+    logger.info(f"Loading hydrography from: {hydro_path}")
+    ds = xr.open_dataset(hydro_path, engine='scipy')
+
+    # Get currents from hydrography (indexed by farm_id)
+    hydro_farm_ids = ds['farm_id'].values  # Farm IDs in hydro data
+    u_raw = ds['u'].values  # (T, N_hydro)
+    v_raw = ds['v'].values  # (T, N_hydro)
+
+    logger.info(f"  Hydro data shape: {u_raw.shape}")
+    logger.info(f"  Matching {N} graph nodes to {len(hydro_farm_ids)} hydro farms...")
+
+    # Create mapping from hydro farm_id to index
+    hydro_id_to_idx = {fid: i for i, fid in enumerate(hydro_farm_ids)}
+
+    # Map graph nodes to hydro data indices
+    u_aligned = np.full((u_raw.shape[0], N), np.nan)
+    v_aligned = np.full((v_raw.shape[0], N), np.nan)
+    matched = 0
+
+    for i, loc_id in enumerate(locality_ids):
+        if loc_id in hydro_id_to_idx:
+            hydro_idx = hydro_id_to_idx[loc_id]
+            u_aligned[:, i] = u_raw[:, hydro_idx]
+            v_aligned[:, i] = v_raw[:, hydro_idx]
+            matched += 1
+
+    logger.info(f"  Matched {matched}/{N} nodes to hydrography data")
+    logger.info(f"  NaN fraction in u: {np.isnan(u_aligned).mean():.1%}")
+
+    # Compute flux weights using aligned currents
+    flux_weights = compute_flux_weights(
+        edge_index, coords, u_aligned, v_aligned, dist_matrix, decay_km
+    )
+
+    # Also compute distance weights for comparison
+    dist_weights = compute_edge_weights(edge_index, dist_matrix, "inverse")
+
+    # Handle NaN values in flux weights - replace with 0
+    flux_weights_clean = flux_weights.clone()
+    nan_mask = torch.isnan(flux_weights_clean)
+    flux_weights_clean[nan_mask] = 0.0
+
+    # Combine: use flux where available, fall back to distance
+    # This ensures isolated farms still have some connectivity
+    combined_weights = flux_weights_clean.clone()
+    low_flux = (flux_weights_clean < 0.01) | nan_mask
+    combined_weights[low_flux] = dist_weights[low_flux] * 0.1  # Reduced weight for distance-only
+
+    # Build output dict
+    graph_data = {
+        "edge_index": edge_index,
+        "edge_weights": combined_weights,
+        "flux_weights": flux_weights_clean,
+        "distance_weights": dist_weights,
+        "degree": degree,
+        "distance_matrix": dist_matrix,
+        "distance_threshold_km": distance_threshold_km,
+        "decay_km": decay_km,
+        "n_nodes": len(coords),
+        "n_edges": edge_index.shape[1],
+    }
+
+    # Statistics
+    valid_flux = flux_weights_clean[~nan_mask]
+    n_flux_edges = (flux_weights_clean > 0.01).sum().item()
+    logger.info(f"\nFlux-weighted graph statistics:")
+    logger.info(f"  Total edges: {edge_index.shape[1]}")
+    logger.info(f"  NaN flux edges: {nan_mask.sum().item()}")
+    logger.info(f"  Flux-active edges: {n_flux_edges} ({100*n_flux_edges/edge_index.shape[1]:.1f}%)")
+    logger.info(f"  Mean flux weight (valid): {valid_flux.mean():.4f}" if len(valid_flux) > 0 else "  No valid flux weights")
+
+    # Save if path provided
+    if output_path is not None:
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(graph_data, output_path)
+        logger.info(f"\nSaved flux-weighted graph to: {output_path}")
+
+    return graph_data
+
+
 def merge_graphs(
     edge_indices: list,
     n_nodes: int,
