@@ -111,14 +111,13 @@ class GLKANTrainer:
             betas=self.config.betas,
         )
 
-        # Scheduler - ReduceLROnPlateau with verbose logging
+        # Scheduler - ReduceLROnPlateau
         self.scheduler = ReduceLROnPlateau(
             self.optimizer,
             mode='min',
             factor=self.config.scheduler_factor,
             patience=self.config.scheduler_patience,
             min_lr=self.config.min_lr,
-            verbose=True,  # Print when LR is reduced
         )
 
         # Training state
