@@ -110,6 +110,11 @@ class SeaLiceGraphDataset(Dataset):
         if "feature_indices" in data:
             self.feature_indices = data["feature_indices"].item()  # Convert from numpy object
             logger.info(f"Loaded feature_indices for SeaLiceGLKAN: {list(self.feature_indices.keys())}")
+        elif "feature_indices_json" in data:
+            # Handle JSON-serialized feature indices
+            import json
+            self.feature_indices = json.loads(str(data["feature_indices_json"]))
+            logger.info(f"Loaded feature_indices for SeaLiceGLKAN: {list(self.feature_indices.keys())}")
         else:
             # Default feature indices if not saved in tensor file
             self.feature_indices = None
