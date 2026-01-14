@@ -38,6 +38,14 @@ from .conformal import (
     MultiCoveragePredictor,
     evaluate_coverage,
 )
+from .timegan import (
+    TimeGANConfig,
+    OutbreakTimeGAN,
+    OutbreakAugmenter,
+    # Spatially-aware generation (RECOMMENDED)
+    SpatialOutbreakSimulator,
+    SpatialAugmenter,
+)
 
 __all__ = [
     # Core layers
@@ -71,4 +79,11 @@ __all__ = [
     "ConformalSeaLicePredictor",
     "MultiCoveragePredictor",
     "evaluate_coverage",
+    # TimeGAN (Rare Event Augmentation)
+    "TimeGANConfig",
+    "OutbreakTimeGAN",
+    "OutbreakAugmenter",
+    # Spatially-Aware Outbreak Simulation (RECOMMENDED)
+    "SpatialOutbreakSimulator",
+    "SpatialAugmenter",
 ]
