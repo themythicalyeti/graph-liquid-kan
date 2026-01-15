@@ -532,3 +532,269 @@ def merge_graphs(
     unique_tensor = torch.tensor(unique_edges, dtype=torch.long).T
 
     return unique_tensor
+
+
+def compute_static_edge_features(
+    edge_index: torch.Tensor,
+    coords: np.ndarray,
+    dist_matrix: np.ndarray,
+) -> Dict[str, torch.Tensor]:
+    """
+    Compute STATIC edge features that don't change over time.
+
+    These are geometric properties of the farm-to-farm connections:
+    - Distance between farms
+    - Direction unit vector (for computing flux with currents)
+
+    Args:
+        edge_index: (2, E) edge indices [src, dst]
+        coords: (N, 2) array of [lat, lon] coordinates
+        dist_matrix: (N, N) distance matrix in km
+
+    Returns:
+        Dict with:
+        - edge_distance: (E,) distance in km
+        - edge_direction: (E, 2) unit vector [east, north] from src to dst
+    """
+    src = edge_index[0].numpy()
+    dst = edge_index[1].numpy()
+    E = len(src)
+
+    # Get coordinates
+    lat = coords[:, 0]
+    lon = coords[:, 1]
+
+    # Distance per edge
+    edge_distance = dist_matrix[src, dst]
+
+    # Direction vectors from src to dst
+    # At Norwegian latitudes (~60-70°N):
+    # 1 degree lat ≈ 111 km
+    # 1 degree lon ≈ 55 km (varies with latitude)
+    lat_scale = 111.0  # km per degree latitude
+    lon_scale = 55.0   # km per degree longitude (approximate)
+
+    # Direction in km
+    dir_east = (lon[dst] - lon[src]) * lon_scale   # (E,) eastward component
+    dir_north = (lat[dst] - lat[src]) * lat_scale  # (E,) northward component
+
+    # Normalize to unit vector
+    dir_magnitude = np.sqrt(dir_east**2 + dir_north**2)
+    dir_magnitude = np.maximum(dir_magnitude, 0.1)  # Avoid division by zero
+
+    edge_direction = np.stack([
+        dir_east / dir_magnitude,
+        dir_north / dir_magnitude,
+    ], axis=1)  # (E, 2)
+
+    return {
+        'edge_distance': torch.tensor(edge_distance, dtype=torch.float32),
+        'edge_direction': torch.tensor(edge_direction, dtype=torch.float32),
+    }
+
+
+def compute_dynamic_edge_attr(
+    edge_index: torch.Tensor,
+    edge_direction: torch.Tensor,
+    edge_distance: torch.Tensor,
+    node_features: torch.Tensor,
+    feature_indices: Dict[str, int],
+    decay_km: float = 15.0,
+) -> torch.Tensor:
+    """
+    Compute DYNAMIC edge attributes from current node features.
+
+    This is the key function for physics-informed larval transport.
+    Called per-timestep to get current-dependent edge weights.
+
+    Physics:
+        flux(A→B) = current_A · direction(A→B)
+
+        If flux > 0: water flows from A toward B (larvae transport)
+        If flux < 0: water flows away (no transport)
+
+    Args:
+        edge_index: (2, E) edge indices [src, dst]
+        edge_direction: (E, 2) unit direction vectors [east, north]
+        edge_distance: (E,) distances in km
+        node_features: (N, F) current node features
+        feature_indices: Dict mapping feature names to indices
+        decay_km: Distance decay scale for larval survival
+
+    Returns:
+        edge_attr: (E, 4) tensor with [distance, flux, temp_src, sal_src]
+    """
+    src = edge_index[0]
+    dst = edge_index[1]
+
+    # Extract relevant features from nodes
+    temp_idx = feature_indices.get('temperature', 11)
+    sal_idx = feature_indices.get('salinity', 12)
+    u_idx = feature_indices.get('current_u', 13)
+    v_idx = feature_indices.get('current_v', 14)
+
+    # Get currents at source farms
+    current_u = node_features[src, u_idx]  # (E,) eastward current
+    current_v = node_features[src, v_idx]  # (E,) northward current
+
+    # Compute flux: dot product of current and direction
+    # flux > 0 means water flows from src toward dst
+    flux = (current_u * edge_direction[:, 0] +
+            current_v * edge_direction[:, 1])  # (E,)
+
+    # Only keep positive flux (water flowing toward dst)
+    flux_positive = torch.clamp(flux, min=0)
+
+    # Apply distance decay (larvae mortality during transport)
+    distance_factor = torch.exp(-edge_distance / decay_km)
+
+    # Weighted flux
+    weighted_flux = flux_positive * distance_factor
+
+    # Get environmental conditions at source
+    temp_src = node_features[src, temp_idx]
+    sal_src = node_features[src, sal_idx]
+
+    # Stack into edge_attr: [distance, flux, temp, salinity]
+    edge_attr = torch.stack([
+        edge_distance,
+        weighted_flux,
+        temp_src,
+        sal_src,
+    ], dim=1)  # (E, 4)
+
+    return edge_attr
+
+
+def compute_dynamic_edge_attr_batched(
+    edge_index: torch.Tensor,
+    edge_direction: torch.Tensor,
+    edge_distance: torch.Tensor,
+    node_features: torch.Tensor,
+    feature_indices: Dict[str, int],
+    decay_km: float = 15.0,
+) -> torch.Tensor:
+    """
+    Batched version of compute_dynamic_edge_attr.
+
+    Handles input with batch and time dimensions.
+
+    Args:
+        edge_index: (2, E) edge indices
+        edge_direction: (E, 2) unit direction vectors
+        edge_distance: (E,) distances in km
+        node_features: (B, T, N, F) or (T, N, F) node features
+        feature_indices: Dict mapping feature names to indices
+        decay_km: Distance decay scale
+
+    Returns:
+        edge_attr: (B, T, E, 4) or (T, E, 4) dynamic edge attributes
+    """
+    # Handle different input shapes
+    if node_features.dim() == 3:
+        # (T, N, F) -> add batch dim
+        node_features = node_features.unsqueeze(0)
+        squeeze_batch = True
+    else:
+        squeeze_batch = False
+
+    B, T, N, F = node_features.shape
+    E = edge_index.shape[1]
+    device = node_features.device
+
+    # Move static features to same device
+    edge_direction = edge_direction.to(device)
+    edge_distance = edge_distance.to(device)
+
+    # Extract feature indices
+    temp_idx = feature_indices.get('temperature', 11)
+    sal_idx = feature_indices.get('salinity', 12)
+    u_idx = feature_indices.get('current_u', 13)
+    v_idx = feature_indices.get('current_v', 14)
+
+    src = edge_index[0]  # (E,)
+
+    # Get source node features for all edges: (B, T, E, F)
+    # node_features[:, :, src] -> (B, T, E, F)
+    src_features = node_features[:, :, src, :]
+
+    # Extract currents at source: (B, T, E)
+    current_u = src_features[:, :, :, u_idx]
+    current_v = src_features[:, :, :, v_idx]
+
+    # Compute flux: (B, T, E)
+    # edge_direction is (E, 2), broadcast over B, T
+    flux = (current_u * edge_direction[:, 0].view(1, 1, E) +
+            current_v * edge_direction[:, 1].view(1, 1, E))
+
+    # Positive flux only
+    flux_positive = torch.clamp(flux, min=0)
+
+    # Distance decay: (E,) -> (1, 1, E)
+    distance_factor = torch.exp(-edge_distance / decay_km).view(1, 1, E)
+    weighted_flux = flux_positive * distance_factor
+
+    # Environmental at source: (B, T, E)
+    temp_src = src_features[:, :, :, temp_idx]
+    sal_src = src_features[:, :, :, sal_idx]
+
+    # Stack: (B, T, E, 4)
+    edge_attr = torch.stack([
+        edge_distance.view(1, 1, E).expand(B, T, E),
+        weighted_flux,
+        temp_src,
+        sal_src,
+    ], dim=-1)
+
+    if squeeze_batch:
+        edge_attr = edge_attr.squeeze(0)
+
+    return edge_attr
+
+
+def add_static_edge_features_to_graph(
+    graph_path: Union[str, Path],
+    nodes_path: Union[str, Path],
+    output_path: Optional[Union[str, Path]] = None,
+) -> Dict:
+    """
+    Add static edge features (direction, distance) to existing graph.
+
+    This updates spatial_graph.pt with the geometric features needed
+    for dynamic flux computation.
+
+    Args:
+        graph_path: Path to existing spatial_graph.pt
+        nodes_path: Path to graph_nodes_metadata.csv
+        output_path: Path to save updated graph (default: overwrite)
+
+    Returns:
+        Updated graph dict
+    """
+    logger.info("Adding static edge features to graph...")
+
+    # Load existing graph
+    graph = torch.load(graph_path, map_location='cpu', weights_only=False)
+    edge_index = graph['edge_index']
+    dist_matrix = graph['distance_matrix']
+
+    # Load coordinates
+    nodes_df = pd.read_csv(nodes_path)
+    coords = nodes_df[["latitude", "longitude"]].values
+
+    # Compute static edge features
+    static_features = compute_static_edge_features(edge_index, coords, dist_matrix)
+
+    # Add to graph
+    graph['edge_distance'] = static_features['edge_distance']
+    graph['edge_direction'] = static_features['edge_direction']
+
+    logger.info(f"  Added edge_distance: {graph['edge_distance'].shape}")
+    logger.info(f"  Added edge_direction: {graph['edge_direction'].shape}")
+
+    # Save
+    output_path = output_path or graph_path
+    torch.save(graph, output_path)
+    logger.info(f"  Saved to: {output_path}")
+
+    return graph

@@ -1679,3 +1679,754 @@ class SpatialAugmenter:
         labels = labels[perm]
 
         return X_synthetic, labels
+
+
+# ============================================================================
+# HYBRID SPATIAL OUTBREAK SIMULATOR
+# Uses static edge geometry + dynamic flux computation from currents
+# ============================================================================
+
+class HybridSpatialOutbreakSimulator(nn.Module):
+    """
+    Physics-Informed Outbreak Simulator with HYBRID edge attributes.
+
+    KEY INNOVATION: Separates static vs dynamic edge properties
+    - STATIC (precomputed): distance, direction vectors between farms
+    - DYNAMIC (per-timestep): flux computed from current node features
+
+    This captures the time-varying nature of larval transport:
+    - Summer: Strong currents → fast outbreak spread
+    - Winter: Weak currents → slow/no spread
+    - Counterfactual: "What if currents were 20% stronger?"
+
+    Physics:
+        flux(A→B, t) = current_A(t) · direction(A→B)
+
+        If flux > 0: water flows from A toward B (larvae transport possible)
+        If flux < 0: water flows away from B (no transport this direction)
+
+    Architecture:
+        1. Static edge features loaded once from graph
+        2. Dynamic edge_attr computed each timestep from node currents
+        3. GNN-style message passing with flux-weighted attention
+        4. Liquid neural network for temporal dynamics
+
+    Usage:
+        # Initialize with static graph features
+        simulator = HybridSpatialOutbreakSimulator(
+            n_farms=1777,
+            edge_index=graph['edge_index'],
+            edge_distance=graph['edge_distance'],
+            edge_direction=graph['edge_direction'],
+            feature_indices=feature_indices,
+        )
+
+        # Train on real data (X contains node features with currents)
+        simulator.fit(Y_lice, X_features, edge_index)
+
+        # Generate scenarios - flux computed dynamically from X
+        X_synthetic = simulator.generate_outbreak_scenarios(
+            n_scenarios=1000,
+            env_data=X_features,  # Contains current_u, current_v
+        )
+
+    Args:
+        n_farms: Number of farms
+        edge_index: (2, E) graph edges
+        edge_distance: (E,) static distances in km
+        edge_direction: (E, 2) static unit direction vectors
+        feature_indices: Dict mapping feature names to indices in X
+        feature_dim: Lice output dimension (default 3: AF, mobile, attached)
+        hidden_dim: Hidden layer size
+        decay_km: Distance decay for larval survival
+    """
+
+    def __init__(
+        self,
+        n_farms: int,
+        edge_index: torch.Tensor,
+        edge_distance: torch.Tensor,
+        edge_direction: torch.Tensor,
+        feature_indices: Dict[str, int],
+        feature_dim: int = 3,
+        hidden_dim: int = 64,
+        decay_km: float = 15.0,
+        outbreak_threshold: float = 0.5,
+    ):
+        super().__init__()
+
+        self.n_farms = n_farms
+        self.feature_dim = feature_dim
+        self.hidden_dim = hidden_dim
+        self.decay_km = decay_km
+        self.outbreak_threshold = outbreak_threshold
+        self.feature_indices = feature_indices
+
+        # Register static graph features as buffers (not parameters)
+        self.register_buffer('edge_index', edge_index)
+        self.register_buffer('edge_distance', edge_distance)
+        self.register_buffer('edge_direction', edge_direction)
+
+        # Number of edges
+        self.n_edges = edge_index.shape[1]
+
+        # ===================================================================
+        # Edge encoder: takes dynamic edge_attr [dist, flux, temp, sal]
+        # ===================================================================
+        self.edge_encoder = nn.Sequential(
+            nn.Linear(4, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Attention for flux-weighted neighbor influence
+        self.attention_net = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        # ===================================================================
+        # Environmental encoder
+        # ===================================================================
+        # Determine env_dim from feature_indices
+        env_features = ['temperature', 'salinity', 'current_u', 'current_v', 'current_speed']
+        self.env_indices = [feature_indices.get(f, i) for i, f in enumerate(env_features)]
+        env_dim = len(self.env_indices)
+
+        self.env_encoder = nn.Sequential(
+            nn.Linear(env_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+
+        # Temperature → fecundity (learned Belehradek-like)
+        self.fecundity_net = nn.Sequential(
+            nn.Linear(1, 32),
+            nn.ReLU(),
+            nn.Linear(32, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+            nn.Softplus(),
+        )
+
+        # ===================================================================
+        # Dynamics: GRU cell for temporal evolution
+        # ===================================================================
+        self.dynamics_net = nn.GRUCell(
+            input_size=hidden_dim + env_dim + feature_dim,
+            hidden_size=hidden_dim,
+        )
+
+        # Output decoder
+        self.output_decoder = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, feature_dim),
+            nn.Softplus(),
+        )
+
+        # ===================================================================
+        # Learned epidemic parameters
+        # ===================================================================
+        self.log_beta = nn.Parameter(torch.tensor(-1.0))  # Transmission rate
+        self.log_sigma = nn.Parameter(torch.tensor(-2.0))  # Noise level
+        self.temp_sensitivity = nn.Parameter(torch.tensor(0.1))
+
+        self.is_fitted = False
+
+    @property
+    def beta(self):
+        return torch.exp(self.log_beta)
+
+    @property
+    def sigma(self):
+        return torch.exp(self.log_sigma)
+
+    def compute_dynamic_edge_attr(
+        self,
+        node_features: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute edge attributes dynamically from current node features.
+
+        Args:
+            node_features: (N, F) node features at current timestep
+
+        Returns:
+            edge_attr: (E, 4) with [distance, flux, temp_src, sal_src]
+        """
+        device = node_features.device
+        src = self.edge_index[0]
+
+        # Feature indices
+        temp_idx = self.feature_indices.get('temperature', 11)
+        sal_idx = self.feature_indices.get('salinity', 12)
+        u_idx = self.feature_indices.get('current_u', 13)
+        v_idx = self.feature_indices.get('current_v', 14)
+
+        # Get currents at source farms
+        current_u = node_features[src, u_idx]  # (E,)
+        current_v = node_features[src, v_idx]  # (E,)
+
+        # Compute flux: dot product of current and direction
+        flux = (current_u * self.edge_direction[:, 0] +
+                current_v * self.edge_direction[:, 1])
+
+        # Positive flux only (water flowing toward destination)
+        flux_positive = torch.clamp(flux, min=0)
+
+        # Distance decay
+        distance_factor = torch.exp(-self.edge_distance / self.decay_km)
+        weighted_flux = flux_positive * distance_factor
+
+        # Environmental at source
+        temp_src = node_features[src, temp_idx]
+        sal_src = node_features[src, sal_idx]
+
+        # Stack into edge_attr
+        edge_attr = torch.stack([
+            self.edge_distance,
+            weighted_flux,
+            temp_src,
+            sal_src,
+        ], dim=1)
+
+        return edge_attr
+
+    def spatial_aggregation(
+        self,
+        h: torch.Tensor,
+        lice: torch.Tensor,
+        edge_attr: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute infection pressure from neighbors with flux-weighted attention.
+
+        Args:
+            h: Hidden states (N, hidden_dim)
+            lice: Current lice counts (N, feature_dim)
+            edge_attr: Dynamic edge attributes (E, 4)
+
+        Returns:
+            pressure: Infection pressure (N, hidden_dim)
+        """
+        N = h.shape[0]
+        device = h.device
+
+        src, dst = self.edge_index[0], self.edge_index[1]
+
+        # Encode edge features (includes flux!)
+        edge_features = self.edge_encoder(edge_attr)  # (E, hidden_dim)
+
+        # Source hidden states
+        h_src = h[src]  # (E, hidden_dim)
+
+        # Attention: combine edge features and source state
+        edge_and_source = torch.cat([edge_features, h_src], dim=-1)
+        attention_logits = self.attention_net(edge_and_source).squeeze(-1)
+
+        # Weight by flux (edge_attr[:, 1] is the weighted flux)
+        flux_weight = edge_attr[:, 1]  # (E,)
+        attention_logits = attention_logits + torch.log(flux_weight + 1e-8)
+
+        # Softmax per destination
+        attention_max = torch.zeros(N, device=device)
+        attention_max.scatter_reduce_(0, dst, attention_logits, reduce='amax', include_self=False)
+        attention_exp = torch.exp(attention_logits - attention_max[dst])
+        attention_sum = torch.zeros(N, device=device)
+        attention_sum.scatter_add_(0, dst, attention_exp)
+        attention_weights = attention_exp / (attention_sum[dst] + 1e-8)
+
+        # Source lice (adult females)
+        source_lice = lice[src, 0]
+
+        # Weighted message
+        weighted = attention_weights * source_lice * self.beta
+        weighted = weighted.unsqueeze(-1) * h_src
+
+        # Aggregate to destination
+        pressure = torch.zeros(N, self.hidden_dim, device=device)
+        pressure.scatter_add_(0, dst.unsqueeze(-1).expand(-1, self.hidden_dim), weighted)
+
+        return pressure
+
+    def step(
+        self,
+        h: torch.Tensor,
+        lice: torch.Tensor,
+        node_features: torch.Tensor,
+        add_noise: bool = True,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Single timestep with dynamic edge_attr computation.
+
+        Args:
+            h: Hidden state (N, hidden_dim)
+            lice: Current lice counts (N, feature_dim)
+            node_features: Full node features (N, F)
+            add_noise: Whether to add stochastic noise
+
+        Returns:
+            h_new, lice_new
+        """
+        N = h.shape[0]
+
+        # Compute dynamic edge attributes from current conditions
+        edge_attr = self.compute_dynamic_edge_attr(node_features)
+
+        # Extract environmental features
+        env = node_features[:, self.env_indices]
+
+        # Temperature for fecundity
+        temp_idx = self.feature_indices.get('temperature', 11)
+        temperature = node_features[:, temp_idx]
+        temp_norm = (temperature - 10.0) / 5.0
+        fecundity = self.fecundity_net(temp_norm.unsqueeze(-1)).squeeze(-1)
+
+        # Spatial infection pressure
+        pressure = self.spatial_aggregation(h, lice, edge_attr)
+
+        # Encode environment
+        env_encoded = self.env_encoder(env)
+
+        # Dynamics input
+        dynamics_input = torch.cat([
+            env_encoded + pressure,
+            env,
+            lice,
+        ], dim=-1)
+
+        # Update hidden state
+        h_new = self.dynamics_net(dynamics_input, h)
+
+        # Decode to lice counts
+        lice_base = self.output_decoder(h_new)
+
+        # Temperature modulation (expand fecundity to match feature_dim)
+        fecundity_expanded = fecundity.unsqueeze(-1)  # (N,) -> (N, 1)
+        lice_modulated = lice_base * (1 + self.temp_sensitivity * (fecundity_expanded - 1))
+
+        # Stochastic noise
+        if add_noise:
+            noise = torch.randn_like(lice_modulated) * self.sigma * (lice_modulated + 0.01)
+            lice_new = F.relu(lice_modulated + noise)
+        else:
+            lice_new = lice_modulated
+
+        return h_new, lice_new
+
+    def forward(
+        self,
+        node_features_sequence: torch.Tensor,
+        initial_lice: Optional[torch.Tensor] = None,
+        add_noise: bool = True,
+    ) -> torch.Tensor:
+        """
+        Generate outbreak trajectory with dynamic flux computation.
+
+        Args:
+            node_features_sequence: (T, N, F) full node features over time
+            initial_lice: (N, feature_dim) starting lice counts
+            add_noise: Whether to add stochastic noise
+
+        Returns:
+            lice_trajectory: (T, N, feature_dim)
+        """
+        T, N, F = node_features_sequence.shape
+        device = node_features_sequence.device
+
+        # Initialize
+        h = torch.zeros(N, self.hidden_dim, device=device)
+        if initial_lice is None:
+            lice = torch.zeros(N, self.feature_dim, device=device)
+        else:
+            lice = initial_lice.clone()
+
+        trajectory = []
+        for t in range(T):
+            node_features_t = node_features_sequence[t]
+            h, lice = self.step(h, lice, node_features_t, add_noise)
+            trajectory.append(lice)
+
+        return torch.stack(trajectory, dim=0)
+
+    def fit(
+        self,
+        Y: torch.Tensor,
+        X: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        epochs: int = 100,
+        lr: float = 1e-3,
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+        verbose: bool = True,
+    ) -> Dict[str, List[float]]:
+        """
+        Train on real outbreak data.
+
+        Args:
+            Y: Target lice counts (T, N, feature_dim) or (B, T, N, feature_dim)
+            X: Node features (T, N, F) or (B, T, N, F)
+            mask: Observation mask
+            epochs: Training epochs
+            lr: Learning rate
+            device: Device
+            verbose: Show progress
+
+        Returns:
+            Training history
+        """
+        self.to(device)
+
+        # Handle batched input
+        if Y.dim() == 3:
+            Y = Y.unsqueeze(0)
+            X = X.unsqueeze(0)
+            if mask is not None:
+                mask = mask.unsqueeze(0)
+
+        Y = Y.to(device)
+        X = X.to(device)
+        if mask is not None:
+            mask = mask.to(device)
+
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        history = {'loss': []}
+
+        for epoch in tqdm(range(epochs), disable=not verbose):
+            epoch_loss = 0.0
+            n_batches = Y.shape[0]
+
+            for i in range(n_batches):
+                optimizer.zero_grad()
+
+                y_true = Y[i]  # (T, N, F)
+                x_seq = X[i]   # (T, N, features)
+                sample_mask = mask[i] if mask is not None else None
+
+                # Initial condition
+                initial = y_true[0]
+
+                # Forward (flux computed dynamically!)
+                y_pred = self.forward(x_seq, initial_lice=initial, add_noise=False)
+
+                # Loss
+                if sample_mask is not None:
+                    diff = (y_pred - y_true) ** 2
+                    loss = (diff * sample_mask.unsqueeze(-1)).sum() / (sample_mask.sum() + 1e-8)
+                else:
+                    loss = F.mse_loss(y_pred, y_true)
+
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+
+            history['loss'].append(epoch_loss / n_batches)
+
+        self.is_fitted = True
+        return history
+
+    def generate_outbreak_scenarios(
+        self,
+        n_scenarios: int,
+        X: torch.Tensor,
+        seed_farms: Optional[List[int]] = None,
+        initial_intensity: float = 0.3,
+        temperature_perturbation: float = 0.0,
+        current_scale: float = 1.0,
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+    ) -> torch.Tensor:
+        """
+        Generate synthetic outbreak scenarios with controllable conditions.
+
+        KEY: Uses node features X which contains currents, so flux is computed
+        dynamically. Can perturb temperature/currents for counterfactual analysis.
+
+        Args:
+            n_scenarios: Number of scenarios to generate
+            X: Node features (T, N, F) with currents for flux computation
+            seed_farms: Which farms to seed (None = random)
+            initial_intensity: Starting lice level at seed farms
+            temperature_perturbation: Add this to temperature (nightmare mode)
+            current_scale: Multiply currents by this (stronger = faster spread)
+            device: Device
+
+        Returns:
+            scenarios: (n_scenarios, T, N, feature_dim)
+        """
+        self.eval()
+        self.to(device)
+
+        T, N, F = X.shape
+        X = X.to(device)
+
+        # Get feature indices for perturbation
+        temp_idx = self.feature_indices.get('temperature', 11)
+        u_idx = self.feature_indices.get('current_u', 13)
+        v_idx = self.feature_indices.get('current_v', 14)
+
+        scenarios = []
+
+        for i in range(n_scenarios):
+            # Perturb conditions
+            X_perturbed = X.clone()
+
+            # Temperature perturbation (nightmare: warmer = more fecundity)
+            if temperature_perturbation != 0:
+                X_perturbed[:, :, temp_idx] += temperature_perturbation
+
+            # Current scaling (nightmare: stronger currents = faster spread)
+            if current_scale != 1.0:
+                X_perturbed[:, :, u_idx] *= current_scale
+                X_perturbed[:, :, v_idx] *= current_scale
+
+            # Random temperature variation per scenario
+            temp_noise = torch.randn(1, device=device) * 1.0
+            X_perturbed[:, :, temp_idx] += temp_noise
+
+            # Initial lice conditions
+            initial = torch.zeros(N, self.feature_dim, device=device)
+
+            if seed_farms is None:
+                n_seeds = torch.randint(1, min(6, N), (1,)).item()
+                seeds = torch.randperm(N)[:n_seeds].tolist()
+            else:
+                seeds = seed_farms
+
+            for farm_idx in seeds:
+                intensity = initial_intensity * (0.5 + torch.rand(1).item())
+                initial[farm_idx, 0] = intensity  # Adult females
+                initial[farm_idx, 1] = intensity * 0.5  # Mobile
+                initial[farm_idx, 2] = intensity * 0.3  # Attached
+
+            # Generate trajectory
+            with torch.no_grad():
+                trajectory = self.forward(
+                    X_perturbed,
+                    initial_lice=initial,
+                    add_noise=True,
+                )
+
+            scenarios.append(trajectory)
+
+        return torch.stack(scenarios, dim=0)
+
+    def generate_nightmare_scenario(
+        self,
+        X: torch.Tensor,
+        temperature_increase: float = 3.0,
+        current_boost: float = 1.5,
+        n_seed_farms: int = 5,
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+    ) -> torch.Tensor:
+        """
+        Generate absolute worst-case: hot summer + strong currents + hub seeding.
+
+        Args:
+            X: Node features for flux computation
+            temperature_increase: Degrees warmer than normal
+            current_boost: Current multiplier (1.5 = 50% stronger)
+            n_seed_farms: Number of initial outbreak farms (highest degree)
+            device: Device
+
+        Returns:
+            worst_case: (T, N, feature_dim)
+        """
+        self.eval()
+        self.to(device)
+
+        T, N, F = X.shape
+        X = X.to(device)
+
+        # Find highest-degree farms (hubs) as seeds
+        src = self.edge_index[0].cpu()
+        degrees = torch.zeros(N)
+        for s in src:
+            degrees[s] += 1
+        _, top_farms = torch.topk(degrees, n_seed_farms)
+        seed_farms = top_farms.tolist()
+
+        # Generate with nightmare conditions
+        scenarios = self.generate_outbreak_scenarios(
+            n_scenarios=1,
+            X=X,
+            seed_farms=seed_farms,
+            initial_intensity=0.5,  # Higher initial
+            temperature_perturbation=temperature_increase,
+            current_scale=current_boost,
+            device=device,
+        )
+
+        return scenarios[0]  # Return single scenario
+
+
+class HybridOutbreakAugmenter:
+    """
+    Complete pipeline for physics-informed outbreak augmentation.
+
+    Wraps HybridSpatialOutbreakSimulator with utilities for:
+    1. Training on historical data
+    2. Generating nightmare scenarios with dynamic flux
+    3. Creating balanced pre-training datasets
+
+    Usage:
+        # Initialize with graph
+        augmenter = HybridOutbreakAugmenter.from_graph(
+            graph_path='data/processed/spatial_graph.pt',
+            feature_indices=feature_indices,
+        )
+
+        # Train on real data
+        augmenter.fit(Y_lice, X_features)
+
+        # Generate pre-training data (50% outbreaks)
+        X_pretrain, Y_pretrain = augmenter.create_pretraining_data(
+            X_real=X_features,
+            outbreak_ratio=0.5,
+            total_samples=5000,
+        )
+    """
+
+    def __init__(
+        self,
+        simulator: HybridSpatialOutbreakSimulator,
+        outbreak_threshold: float = 0.5,
+    ):
+        self.simulator = simulator
+        self.outbreak_threshold = outbreak_threshold
+
+    @classmethod
+    def from_graph(
+        cls,
+        graph_path: str,
+        feature_indices: Dict[str, int],
+        n_farms: Optional[int] = None,
+        **kwargs,
+    ) -> 'HybridOutbreakAugmenter':
+        """
+        Create augmenter from saved graph file.
+
+        Args:
+            graph_path: Path to spatial_graph.pt with edge_direction, edge_distance
+            feature_indices: Dict mapping feature names to indices
+            n_farms: Number of farms (inferred from graph if None)
+            **kwargs: Additional args for simulator
+        """
+        graph = torch.load(graph_path, map_location='cpu', weights_only=False)
+
+        # Check for required static features
+        if 'edge_direction' not in graph:
+            raise ValueError(
+                "Graph missing 'edge_direction'. Run add_static_edge_features_to_graph() first."
+            )
+
+        n_farms = n_farms or graph['n_nodes']
+
+        simulator = HybridSpatialOutbreakSimulator(
+            n_farms=n_farms,
+            edge_index=graph['edge_index'],
+            edge_distance=graph['edge_distance'],
+            edge_direction=graph['edge_direction'],
+            feature_indices=feature_indices,
+            **kwargs,
+        )
+
+        return cls(simulator)
+
+    def fit(
+        self,
+        Y: torch.Tensor,
+        X: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Dict[str, List[float]]:
+        """Train simulator on historical data."""
+        return self.simulator.fit(Y, X, mask, **kwargs)
+
+    def create_pretraining_data(
+        self,
+        X_real: torch.Tensor,
+        outbreak_ratio: float = 0.5,
+        total_samples: int = 5000,
+        temperature_range: Tuple[float, float] = (0.0, 3.0),
+        current_range: Tuple[float, float] = (0.8, 1.5),
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Create pre-training dataset with controlled outbreak ratio.
+
+        Args:
+            X_real: Real node features (T, N, F) for flux computation
+            outbreak_ratio: Fraction of samples that are outbreaks
+            total_samples: Total samples to generate
+            temperature_range: (min, max) temperature perturbation for outbreaks
+            current_range: (min, max) current scaling for outbreaks
+            device: Device
+
+        Returns:
+            X_synthetic: Generated lice data (total_samples, T, N, feature_dim)
+            labels: Binary outbreak labels
+        """
+        n_outbreaks = int(total_samples * outbreak_ratio)
+        n_normal = total_samples - n_outbreaks
+
+        print(f"Generating {n_normal} normal + {n_outbreaks} outbreak scenarios...")
+        print(f"Using dynamic flux from node features")
+
+        # Generate outbreak scenarios (perturbed conditions)
+        outbreak_scenarios = []
+        for i in tqdm(range(n_outbreaks), desc="Generating outbreaks"):
+            # Random perturbation within range
+            temp_perturb = temperature_range[0] + torch.rand(1).item() * (
+                temperature_range[1] - temperature_range[0]
+            )
+            current_scale = current_range[0] + torch.rand(1).item() * (
+                current_range[1] - current_range[0]
+            )
+
+            with torch.no_grad():
+                scenario = self.simulator.generate_outbreak_scenarios(
+                    n_scenarios=1,
+                    X=X_real,
+                    initial_intensity=0.3,
+                    temperature_perturbation=temp_perturb,
+                    current_scale=current_scale,
+                    device=device,
+                )
+            outbreak_scenarios.append(scenario[0])
+
+        # Generate normal scenarios (no perturbation, no seeding)
+        normal_scenarios = []
+        for i in tqdm(range(n_normal), desc="Generating normal"):
+            with torch.no_grad():
+                initial = torch.zeros(
+                    X_real.shape[1], self.simulator.feature_dim, device=device
+                )
+                # Small random initial lice (realistic baseline)
+                initial[:, 0] = torch.rand(X_real.shape[1], device=device) * 0.1
+
+                scenario = self.simulator.forward(
+                    X_real.to(device),
+                    initial_lice=initial,
+                    add_noise=True,
+                )
+            normal_scenarios.append(scenario)
+
+        # Combine
+        X_outbreaks = torch.stack(outbreak_scenarios, dim=0)
+        X_normal = torch.stack(normal_scenarios, dim=0)
+        X_synthetic = torch.cat([X_normal, X_outbreaks], dim=0)
+
+        # Labels based on actual outbreak occurrence
+        labels = (X_synthetic[:, :, :, 0] > self.outbreak_threshold).any(dim=(1, 2)).float()
+
+        # Shuffle
+        perm = torch.randperm(X_synthetic.shape[0])
+        X_synthetic = X_synthetic[perm]
+        labels = labels[perm]
+
+        # Stats
+        actual_outbreak_rate = labels.mean().item()
+        print(f"Actual outbreak rate: {actual_outbreak_rate:.1%}")
+
+        return X_synthetic, labels
