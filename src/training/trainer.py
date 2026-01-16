@@ -26,6 +26,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from loguru import logger
 
 from .losses import GLKANLoss, LossConfig, compute_rmse, compute_mae
+from .pretrain import BiologyPretrainer, BiologyPretrainConfig, get_biology_param_names
 
 
 @dataclass
@@ -66,6 +67,11 @@ class TrainingConfig:
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Biological module pre-training
+    pretrain_biology: bool = True  # Whether to pre-train biology modules
+    pretrained_biology_path: Optional[str] = None  # Path to load pre-trained weights
+    bio_lr_scale: float = 0.5  # Learning rate multiplier for biology modules (0.5 = half)
+
 
 class GLKANTrainer:
     """
@@ -103,13 +109,14 @@ class GLKANTrainer:
         # Loss function
         self.criterion = GLKANLoss(loss_config)
 
-        # Optimizer - AdamW with weight decay
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-            betas=self.config.betas,
-        )
+        # Create checkpoint directory (needed for pre-training)
+        Path(self.config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+
+        # Handle biological module pre-training
+        self._setup_biology_pretraining()
+
+        # Optimizer - AdamW with weight decay and differential LR
+        self.optimizer = self._create_optimizer()
 
         # Scheduler - ReduceLROnPlateau
         self.scheduler = ReduceLROnPlateau(
@@ -130,8 +137,93 @@ class GLKANTrainer:
         self.train_history: List[Dict] = []
         self.val_history: List[Dict] = []
 
-        # Create checkpoint directory
-        Path(self.config.checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    def _setup_biology_pretraining(self) -> None:
+        """Handle pre-training or loading of biological modules."""
+        # Check if model has biology loading capability
+        if not hasattr(self.model, 'load_pretrained_biology') and not hasattr(self.model, 'network'):
+            logger.info("Model does not support biology pre-training, skipping.")
+            return
+
+        # Get the actual network (handle SeaLicePredictor wrapper)
+        network = getattr(self.model, 'network', self.model)
+
+        if not hasattr(network, 'load_pretrained_biology'):
+            logger.info("Network does not support biology pre-training, skipping.")
+            return
+
+        if self.config.pretrained_biology_path:
+            # Load from existing checkpoint
+            pretrained = BiologyPretrainer.load_pretrained(
+                self.config.pretrained_biology_path,
+                device=self.config.device,
+            )
+            network.load_pretrained_biology(pretrained)
+        elif self.config.pretrain_biology:
+            # Run pre-training
+            pretrainer = BiologyPretrainer(BiologyPretrainConfig(
+                device=self.config.device,
+                checkpoint_dir=self.config.checkpoint_dir,
+            ))
+            pretrained = pretrainer.pretrain_all(verbose=True, save=True)
+            network.load_pretrained_biology(pretrained)
+
+    def _create_optimizer(self) -> torch.optim.Optimizer:
+        """
+        Create optimizer with differential learning rates.
+
+        Biology modules get bio_lr_scale * learning_rate (default 0.5x)
+        to preserve pre-trained knowledge while allowing controlled drift.
+        """
+        # Get biology parameter names
+        bio_param_patterns = get_biology_param_names()
+
+        # Separate parameters
+        bio_params = []
+        other_params = []
+        bio_param_ids = set()
+
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            is_bio = any(pattern in name for pattern in bio_param_patterns)
+
+            if is_bio:
+                # Avoid duplicates (some modules may share weights)
+                if id(param) not in bio_param_ids:
+                    bio_params.append(param)
+                    bio_param_ids.add(id(param))
+            else:
+                other_params.append(param)
+
+        # Create parameter groups
+        bio_lr = self.config.learning_rate * self.config.bio_lr_scale
+
+        param_groups = []
+
+        if other_params:
+            param_groups.append({
+                'params': other_params,
+                'lr': self.config.learning_rate,
+                'name': 'other',
+            })
+
+        if bio_params:
+            param_groups.append({
+                'params': bio_params,
+                'lr': bio_lr,
+                'name': 'biology',
+            })
+
+        logger.info(f"Optimizer parameter groups:")
+        logger.info(f"  Other params: {len(other_params)} tensors, LR = {self.config.learning_rate}")
+        logger.info(f"  Biology params: {len(bio_params)} tensors, LR = {bio_lr} ({self.config.bio_lr_scale}x)")
+
+        return torch.optim.AdamW(
+            param_groups,
+            weight_decay=self.config.weight_decay,
+            betas=self.config.betas,
+        )
 
     def get_teacher_forcing_ratio(self) -> float:
         """

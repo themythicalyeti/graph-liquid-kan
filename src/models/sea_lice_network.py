@@ -436,6 +436,70 @@ class SeaLiceGLKAN(nn.Module):
         """Reset all aggregator caches."""
         self.graphon_agg.reset_cache()
 
+    def load_pretrained_biology(self, pretrained: Dict[str, dict]) -> None:
+        """
+        Load pre-trained weights into all biological module instances.
+
+        The model has 4 biological module instances (2 types x 2 locations):
+        - self.belehradek (SeaLiceGLKAN level)
+        - self.salinity_survival (SeaLiceGLKAN level)
+        - self.dynamics_cell.temperature_development (inside dynamics cell)
+        - self.dynamics_cell.salinity_survival (inside dynamics cell)
+
+        All 4 must receive the same pre-trained weights for consistency.
+
+        Args:
+            pretrained: Dict with 'belehradek' and 'salinity_survival' state_dicts
+        """
+        from loguru import logger
+
+        if 'belehradek' not in pretrained or 'salinity_survival' not in pretrained:
+            raise ValueError(
+                "pretrained dict must contain 'belehradek' and 'salinity_survival' keys"
+            )
+
+        belehradek_state = pretrained['belehradek']
+        salinity_state = pretrained['salinity_survival']
+
+        # Load into all 4 instances
+        # 1. Top-level modules
+        self.belehradek.load_state_dict(belehradek_state, strict=False)
+        self.salinity_survival.load_state_dict(salinity_state, strict=False)
+
+        # 2. Dynamics cell internal modules
+        self.dynamics_cell.temperature_development.load_state_dict(
+            belehradek_state, strict=False
+        )
+        self.dynamics_cell.salinity_survival.load_state_dict(
+            salinity_state, strict=False
+        )
+
+        logger.info("Loaded pre-trained biology weights into all 4 module instances:")
+        logger.info("  - self.belehradek")
+        logger.info("  - self.salinity_survival")
+        logger.info("  - self.dynamics_cell.temperature_development")
+        logger.info("  - self.dynamics_cell.salinity_survival")
+
+    def get_biology_parameters(self) -> list:
+        """
+        Get all parameters from biological modules.
+
+        Returns list of parameters that should have reduced learning rate
+        during training to preserve pre-trained biological knowledge.
+
+        Returns:
+            List of parameter tensors from all 4 biological module instances
+        """
+        bio_params = []
+
+        # Collect from all 4 instances (some may share weights, but optimizer handles this)
+        bio_params.extend(self.belehradek.parameters())
+        bio_params.extend(self.salinity_survival.parameters())
+        bio_params.extend(self.dynamics_cell.temperature_development.parameters())
+        bio_params.extend(self.dynamics_cell.salinity_survival.parameters())
+
+        return list(bio_params)
+
 
 class SeaLicePINNLoss(nn.Module):
     """
