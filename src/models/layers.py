@@ -62,7 +62,11 @@ class FastKAN(nn.Module):
 
         # Layer normalization - CRITICAL safety interlock
         # Without this, inputs outside [-1, 1] will have zero gradients
-        self.layer_norm = nn.LayerNorm(in_features)
+        # NOTE: Skip LayerNorm for in_features=1 as it zeros out single-feature inputs
+        if in_features > 1:
+            self.layer_norm = nn.LayerNorm(in_features)
+        else:
+            self.layer_norm = None  # Skip for 1D inputs (e.g., temperature, salinity)
 
         # Create fixed grid centers (non-learnable)
         # Evenly spaced between grid_range[0] and grid_range[1]
@@ -116,7 +120,9 @@ class FastKAN(nn.Module):
 
         # Step 1: Layer Normalization (safety interlock)
         # Forces input into active range of RBF grid
-        x = self.layer_norm(x)
+        # Skip for 1D inputs (layer_norm is None)
+        if self.layer_norm is not None:
+            x = self.layer_norm(x)
 
         # Step 2: RBF Basis Expansion
         # x shape: (..., in_features)

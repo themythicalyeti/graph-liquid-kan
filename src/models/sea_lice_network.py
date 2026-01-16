@@ -76,6 +76,11 @@ class SeaLiceGLKAN(nn.Module):
         dropout: float = 0.1,
         use_larval_transport: bool = True,
         use_mass_conservation: bool = True,
+        # Input denormalization for biological modules (when data is z-scored)
+        temp_mean: Optional[float] = None,
+        temp_std: Optional[float] = None,
+        sal_mean: Optional[float] = None,
+        sal_std: Optional[float] = None,
     ):
         super().__init__()
 
@@ -85,6 +90,12 @@ class SeaLiceGLKAN(nn.Module):
         self.k_hops = k_hops
         self.use_larval_transport = use_larval_transport
         self.use_mass_conservation = use_mass_conservation
+
+        # Store normalization params for biological modules
+        self.temp_mean = temp_mean
+        self.temp_std = temp_std
+        self.sal_mean = sal_mean
+        self.sal_std = sal_std
 
         # ===================================================================
         # Input Processing
@@ -105,11 +116,19 @@ class SeaLiceGLKAN(nn.Module):
         # Biological Modules
         # ===================================================================
 
-        # Temperature-dependent development rate
-        self.belehradek = BelehradekKAN(n_bases=n_bases)
+        # Temperature-dependent development rate (with input denormalization)
+        self.belehradek = BelehradekKAN(
+            n_bases=n_bases,
+            input_mean=temp_mean,
+            input_std=temp_std,
+        )
 
-        # Salinity-dependent survival
-        self.salinity_survival = SalinityMortalityKAN(n_bases=n_bases)
+        # Salinity-dependent survival (with input denormalization)
+        self.salinity_survival = SalinityMortalityKAN(
+            n_bases=n_bases,
+            input_mean=sal_mean,
+            input_std=sal_std,
+        )
 
         # ===================================================================
         # Spatial Aggregation
@@ -143,13 +162,17 @@ class SeaLiceGLKAN(nn.Module):
         # Temporal Dynamics (Liquid Cell)
         # ===================================================================
 
-        # Sea lice-specific dynamics cell
+        # Sea lice-specific dynamics cell (with input denormalization)
         self.dynamics_cell = SeaLiceDynamicsCell(
             env_dim=5,  # Will extract from input
             hidden_dim=hidden_dim,
             n_bases=n_bases,
             tau_min=tau_min,
             tau_max=tau_max,
+            temp_mean=temp_mean,
+            temp_std=temp_std,
+            sal_mean=sal_mean,
+            sal_std=sal_std,
         )
 
         # ===================================================================
@@ -592,6 +615,11 @@ class SeaLicePredictor(nn.Module):
         output_dim: int = 3,
         n_bases: int = 8,
         k_hops: int = 3,
+        # Input denormalization for biological modules (when data is z-scored)
+        temp_mean: Optional[float] = None,
+        temp_std: Optional[float] = None,
+        sal_mean: Optional[float] = None,
+        sal_std: Optional[float] = None,
         **kwargs,
     ):
         super().__init__()
@@ -602,6 +630,10 @@ class SeaLicePredictor(nn.Module):
             output_dim=output_dim,
             n_bases=n_bases,
             k_hops=k_hops,
+            temp_mean=temp_mean,
+            temp_std=temp_std,
+            sal_mean=sal_mean,
+            sal_std=sal_std,
             **kwargs,
         )
 

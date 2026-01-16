@@ -170,13 +170,24 @@ class BelehradekKAN(nn.Module):
         n_bases: int = 12,  # Higher resolution for smooth biological curves
         temp_range: Tuple[float, float] = (0.0, 25.0),
         output_scale: float = 1.0,
+        input_mean: Optional[float] = None,  # For denormalizing z-scored input
+        input_std: Optional[float] = None,   # For denormalizing z-scored input
     ):
         super().__init__()
 
         self.temp_range = temp_range
         self.output_scale = output_scale
 
-        # Temperature normalization parameters
+        # Input denormalization (if data was z-scored before passing to model)
+        # When set, converts z-scored input back to raw °C before processing
+        if input_mean is not None and input_std is not None:
+            self.register_buffer('input_mean', torch.tensor(input_mean))
+            self.register_buffer('input_std', torch.tensor(input_std))
+        else:
+            self.register_buffer('input_mean', None)
+            self.register_buffer('input_std', None)
+
+        # Temperature normalization parameters (for KAN input, expects raw °C)
         temp_min, temp_max = temp_range
         self.register_buffer('temp_mean', torch.tensor((temp_max + temp_min) / 2.0))
         self.register_buffer('temp_std', torch.tensor((temp_max - temp_min) / 2.0))
@@ -200,7 +211,7 @@ class BelehradekKAN(nn.Module):
         Compute development rate from temperature.
 
         Args:
-            temperature: Water temperature in °C, shape (...,) or (..., 1)
+            temperature: Water temperature in °C (or z-scored if input_mean/std set)
 
         Returns:
             dev_rate: Development rate, same shape as input
@@ -210,6 +221,10 @@ class BelehradekKAN(nn.Module):
         if temperature.dim() == 0 or (temperature.dim() > 0 and temperature.shape[-1] != 1):
             temperature = temperature.unsqueeze(-1)
             squeeze_last = True
+
+        # Denormalize if input was z-scored (convert back to raw °C)
+        if self.input_mean is not None and self.input_std is not None:
+            temperature = temperature * self.input_std + self.input_mean
 
         # Apply biological zero (no development below this temperature)
         # Use softplus to ensure smooth gradient
@@ -294,12 +309,22 @@ class SalinityMortalityKAN(nn.Module):
         n_bases: int = 8,
         salinity_range: Tuple[float, float] = (0.0, 40.0),
         threshold_init: float = 25.0,
+        input_mean: Optional[float] = None,  # For denormalizing z-scored input
+        input_std: Optional[float] = None,   # For denormalizing z-scored input
     ):
         super().__init__()
 
         self.salinity_range = salinity_range
 
-        # Normalization
+        # Input denormalization (if data was z-scored before passing to model)
+        if input_mean is not None and input_std is not None:
+            self.register_buffer('input_mean', torch.tensor(input_mean))
+            self.register_buffer('input_std', torch.tensor(input_std))
+        else:
+            self.register_buffer('input_mean', None)
+            self.register_buffer('input_std', None)
+
+        # Normalization for KAN (expects raw PSU)
         sal_min, sal_max = salinity_range
         self.register_buffer('sal_mean', torch.tensor((sal_max + sal_min) / 2.0))
         self.register_buffer('sal_std', torch.tensor((sal_max - sal_min) / 2.0))
@@ -320,7 +345,7 @@ class SalinityMortalityKAN(nn.Module):
         Compute survival factor from salinity.
 
         Args:
-            salinity: Water salinity in ppt, shape (...)
+            salinity: Water salinity in ppt (or z-scored if input_mean/std set)
 
         Returns:
             survival: Survival factor in [0, 1], same shape
@@ -330,7 +355,11 @@ class SalinityMortalityKAN(nn.Module):
             salinity = salinity.unsqueeze(-1)
             squeeze_last = True
 
-        # Normalize
+        # Denormalize if input was z-scored (convert back to raw PSU)
+        if self.input_mean is not None and self.input_std is not None:
+            salinity = salinity * self.input_std + self.input_mean
+
+        # Normalize for KAN input
         sal_normalized = (salinity - self.sal_mean) / self.sal_std
 
         # Compute via KAN
@@ -683,6 +712,10 @@ class SeaLiceDynamicsCell(nn.Module):
         n_bases: int = 8,
         tau_min: float = 1.0,
         tau_max: float = 10.0,
+        temp_mean: Optional[float] = None,  # For denormalizing z-scored temperature
+        temp_std: Optional[float] = None,
+        sal_mean: Optional[float] = None,   # For denormalizing z-scored salinity
+        sal_std: Optional[float] = None,
     ):
         super().__init__()
 
@@ -691,15 +724,19 @@ class SeaLiceDynamicsCell(nn.Module):
         self.tau_min = tau_min
         self.tau_max = tau_max
 
-        # Biological modules
+        # Biological modules (with input denormalization if data is z-scored)
         self.temperature_development = BelehradekKAN(
             n_bases=n_bases,
             temp_range=(0.0, 25.0),
+            input_mean=temp_mean,
+            input_std=temp_std,
         )
 
         self.salinity_survival = SalinityMortalityKAN(
             n_bases=n_bases,
             salinity_range=(0.0, 40.0),
+            input_mean=sal_mean,
+            input_std=sal_std,
         )
 
         # Context encoder: combines env features with biological factors
