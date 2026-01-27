@@ -316,7 +316,7 @@ MIT License
 ```bibtex
 @software{glkan2025,
   title={Graph-Liquid-KAN: Physics-Informed Sea Lice Outbreak Prediction},
-  author={Fiskheidar},
+  author={Stefan G. AKA TheMythicalYeti},
   year={2025},
   url={https://github.com/themythicalyeti/graph-liquid-kan}
 }
