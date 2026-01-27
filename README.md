@@ -14,53 +14,80 @@ A physics-informed deep learning architecture combining **Graph Neural Networks*
 
 > **Note**: Low precision at threshold 0.5 is due to class imbalance (only 1.5% outbreaks). At threshold 0.3 (early warning), F1 = 0.825.
 
+## Visualizations
+
+### Prediction Analysis
+Comprehensive model evaluation showing predicted vs actual values, residuals, distributions, and confusion matrix.
+
+![Prediction Analysis](colab_package/prediction_analysis.png)
+
+### Prediction Scatter
+Density scatter plot of model predictions against ground truth observations.
+
+![Prediction Scatter](colab_package/prediction_scatter.png)
+
+### Infection Spread Simulation
+Animation showing how sea lice infections spread across farms via ocean currents using the HybridSpatialOutbreakSimulator.
+
+![Infection Spread](visuals/output/infection_spread.gif)
+
+### Biology Pre-Training
+Visualization of learned biological relationships (Belehradek temperature curve and salinity survival) compared to theoretical curves.
+
+![Biology Pre-Training](visuals/output/biology_pretrain_visualization.png)
+
 ## Architecture Overview
 
-```
-Input: (B, T, N, 19)                    Output: (B, T, N, 3)
-    │                                       ▲
-    ▼                                       │
-┌───────────────────────────────────────────────────────────────┐
-│                    SeaLicePredictor (226,417 params)          │
-│  ┌─────────────────────────────────────────────────────────┐  │
-│  │                    SeaLiceGLKAN                          │  │
-│  │                                                          │  │
-│  │   ┌─────────────┐                                        │  │
-│  │   │Input Encoder│ FastKAN(19 → 64)                       │  │
-│  │   └──────┬──────┘                                        │  │
-│  │          ▼                                               │  │
-│  │   ┌──────────────────────────────────────────────┐       │  │
-│  │   │           TEMPORAL LOOP (t = 1...T)          │       │  │
-│  │   │                                              │       │  │
-│  │   │  ┌──────────────┐   ┌───────────────────┐   │       │  │
-│  │   │  │ BelehradekKAN│   │SalinityMortalityKAN│   │       │  │
-│  │   │  │ temp → rate  │   │ sal → survival    │   │       │  │
-│  │   │  └──────┬───────┘   └─────────┬─────────┘   │       │  │
-│  │   │         └─────────┬───────────┘             │       │  │
-│  │   │                   ▼                         │       │  │
-│  │   │  ┌────────────────────────────────┐         │       │  │
-│  │   │  │       K-Hop Graph Conv (k=3)   │         │       │  │
-│  │   │  │    Multi-scale spatial mixing   │         │       │  │
-│  │   │  └────────────────┬───────────────┘         │       │  │
-│  │   │                   ▼                         │       │  │
-│  │   │  ┌────────────────────────────────┐         │       │  │
-│  │   │  │    Larval Transport Module     │         │       │  │
-│  │   │  │  Current-driven cross-infection │         │       │  │
-│  │   │  └────────────────┬───────────────┘         │       │  │
-│  │   │                   ▼                         │       │  │
-│  │   │  ┌────────────────────────────────┐         │       │  │
-│  │   │  │    SeaLiceDynamicsCell (CfC)   │         │       │  │
-│  │   │  │  h' = decay*h + (1-decay)*x_eq │         │       │  │
-│  │   │  └────────────────┬───────────────┘         │       │  │
-│  │   │                   ▼                         │       │  │
-│  │   └───────────────────┼──────────────────────────┘       │  │
-│  │                       ▼                                  │  │
-│  │   ┌──────────────────────────────────┐                   │  │
-│  │   │ Output Decoder FastKAN(64 → 3)   │                   │  │
-│  │   │       + softplus (non-negative)   │                   │  │
-│  │   └──────────────────────────────────┘                   │  │
-│  └──────────────────────────────────────────────────────────┘  │
-└───────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    subgraph Input["Input: (B, T, N, 19)"]
+        I[Features: AR lags, temp, salinity, currents, treatments]
+    end
+
+    subgraph SeaLicePredictor["SeaLicePredictor (226,417 params)"]
+        subgraph Encoder["Input Encoding"]
+            IE[FastKAN<br/>19 → 64]
+        end
+
+        subgraph TL["Temporal Loop (t = 1...T)"]
+            subgraph Biology["Biology Modules"]
+                BK[BelehradekKAN<br/>temp → dev_rate]
+                SK[SalinityMortalityKAN<br/>sal → survival]
+            end
+
+            subgraph Spatial["Spatial Processing"]
+                KH[K-Hop Graph Conv<br/>k=3 multi-scale]
+                LT[Larval Transport<br/>current-driven flux]
+            end
+
+            subgraph Dynamics["Temporal Dynamics"]
+                CfC[SeaLiceDynamicsCell<br/>Liquid ODE: τ-adaptive]
+            end
+        end
+
+        subgraph Decoder["Output Decoding"]
+            OD[FastKAN 64 → 3<br/>+ softplus]
+        end
+    end
+
+    subgraph Output["Output: (B, T, N, 3)"]
+        O[adult_female, mobile, attached]
+    end
+
+    I --> IE
+    IE --> BK
+    IE --> SK
+    BK --> KH
+    SK --> KH
+    KH --> LT
+    LT --> CfC
+    CfC --> OD
+    OD --> O
+
+    style SeaLicePredictor fill:#e8f4ea,stroke:#2e7d32
+    style Biology fill:#fff3e0,stroke:#ef6c00
+    style Spatial fill:#e3f2fd,stroke:#1565c0
+    style Dynamics fill:#fce4ec,stroke:#c2185b
 ```
 
 ## Key Innovations
