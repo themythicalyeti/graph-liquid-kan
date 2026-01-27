@@ -19,12 +19,12 @@ A physics-informed deep learning architecture combining **Graph Neural Networks*
 ### Prediction Analysis
 Comprehensive model evaluation showing predicted vs actual values, residuals, distributions, and confusion matrix.
 
-![Prediction Analysis](colab_package/prediction_analysis.png)
+![Prediction Analysis](visuals/output/prediction_analysis.png)
 
 ### Prediction Scatter
 Density scatter plot of model predictions against ground truth observations.
 
-![Prediction Scatter](colab_package/prediction_scatter.png)
+![Prediction Scatter](visuals/output/prediction_scatter.png)
 
 ### Infection Spread Simulation
 Animation showing how sea lice infections spread across farms via ocean currents using the HybridSpatialOutbreakSimulator.
